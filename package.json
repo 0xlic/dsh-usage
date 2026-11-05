@@ -1,6 +1,6 @@
 {
   "name": "dsh-usage",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Model-aware active Codex account quotas and built-in DeepSeek account balance below the DSH composer",
   "private": true,
   "type": "module",
