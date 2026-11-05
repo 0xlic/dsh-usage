@@ -49,7 +49,7 @@ export function resetCountdown(resetsAt, now = Date.now()) {
   };
 }
 
-export function accountRows(status, allUsage) {
+export function accountRows(status, allUsage, includeInactive = false) {
   if (status?.authenticated !== true) return [];
   const accounts = Array.isArray(status.accounts) ? status.accounts : [];
   const values = new Map((Array.isArray(allUsage?.accounts) ? allUsage.accounts : []).map(entry => [entry.id, entry]));
@@ -62,7 +62,45 @@ export function accountRows(status, allUsage) {
     usage: values.get(account.id)?.usage,
     failed: !!values.get(account.id)?.error,
     error: typeof values.get(account.id)?.error === 'string' ? values.get(account.id).error.replace(/[\u0000-\u001f\u007f]/g, ' ').slice(0, 300) : '',
-  })).filter(account => account.active);
+  })).filter(account => includeInactive || account.active);
+}
+
+export function nextPreviewAccountId(accounts, previewId, activeId) {
+  if (!accounts.length) return null;
+  const current = accounts.findIndex(account => account.id === (previewId || activeId));
+  return accounts[(current + 1) % accounts.length].id;
+}
+
+export function codexPreviewState(activeSnapshot, previewSnapshot, previewId) {
+  const value = activeSnapshot.status === 'ready' ? activeSnapshot.value : null;
+  const accounts = value?.accounts ?? [];
+  const activeId = value?.rows?.find(account => account.active)?.id ?? null;
+  const selectedId = accounts.some(account => account.id === previewId) ? previewId : activeId;
+  const isPreview = !!selectedId && !!activeId && selectedId !== activeId;
+  if (!isPreview) return { accounts, activeId, selectedId, isPreview: false, detailSnapshot: activeSnapshot };
+  if (previewSnapshot.status !== 'ready') return { accounts, activeId, selectedId, isPreview, detailSnapshot: previewSnapshot };
+  const selected = previewSnapshot.value?.rows?.find(account => account.id === selectedId);
+  const detailSnapshot = selected ? { status: 'ready', value: { rows: [selected] } } : { status: 'failed', value: null, error: 'account-removed' };
+  return { accounts, activeId, selectedId, isPreview, detailSnapshot };
+}
+
+// Reuse the subscription plugin's Host operation; never select a GPT model or
+// modify credentials ourselves. This is called only by the user's check button.
+export async function activateCodexAccount(call, id, expectedActiveId, signal) {
+  const fail = code => { throw Object.assign(new Error(code), { code }); };
+  const activeIdOf = status => status.accounts?.find(account => account.active)?.id ?? (status.accounts?.length === 1 ? status.accounts[0].id : null);
+  signal?.throwIfAborted();
+  const before = await call('status', {}, signal);
+  signal?.throwIfAborted();
+  if (!before?.authenticated || !before.accounts?.some(account => account.id === id)) fail('account-removed');
+  const currentId = activeIdOf(before);
+  if (currentId === id) return before;
+  if (currentId !== expectedActiveId) fail('active-account-changed');
+  await call('account/select', { id }, signal);
+  signal?.throwIfAborted();
+  const after = await call('status', {}, signal);
+  if (!after?.authenticated || activeIdOf(after) !== id) fail('account-selection-unconfirmed');
+  return after;
 }
 
 // Exact decimal addition: bonus wallets are separate from recharge wallets.
