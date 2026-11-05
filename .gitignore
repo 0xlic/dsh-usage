@@ -1,0 +1,18 @@
+# Local dependencies and build archives
+node_modules/
+*.tgz
+.artifacts/
+coverage/
+
+# Local editor and operating system files
+.DS_Store
+.idea/
+.vscode/
+
+# Private environment and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.log
