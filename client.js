@@ -3,6 +3,7 @@ window.__ModuleLoader__.load({
   id: 'dsh-usage',
   factory(require) {
     const React = require('react');
+    const { createPortal } = require('react-dom');
     const h = React.createElement;
     // Model-specific limit matching follows dsh-codex-subscription 3.2.5's
 // selectModelQuotaWindows semantics. Original implementation here is MIT.
@@ -516,7 +517,9 @@ function createUsageStore(request, { visible = () => true, schedule = setTimeout
               'aria-expanded': open, 'aria-controls': open ? id : undefined,
               onClick: () => { setPosition(null); setOpen(value => !value); },
             }, content),
-            open && h('div', {
+            // DSH 0.2.2 contains the docked composer. Keep viewport-positioned
+            // details outside that containing block; React still owns cleanup.
+            open && createPortal(h('div', {
               id, ref: panelRef, role: 'dialog', tabIndex: -1,
               'aria-labelledby': `${id}-title`, className: 'dshUsagePopover',
               style: { left: position?.left ?? 12, top: position?.top ?? 12 },
@@ -538,7 +541,7 @@ function createUsageStore(request, { visible = () => true, schedule = setTimeout
                 h('span', { className: 'dshUsageSummary' }, kind === 'deepseek' && snapshot.status === 'ready' && !snapshot.value.signedOut ? snapshot.value.totals.map(formatWalletAmount).join(' · ') : t('details')),
                 h('button', { type: 'button', className: 'dshUsageClose', onClick: () => close(true), 'aria-label': t('close') }, '×')),
               actionError && h('div', { className: 'dshUsageActionError', role: 'alert' }, actionError),
-              h(UsageDetails, { snapshot: kind === 'codex' ? preview.detailSnapshot : snapshot, kind, model, modelName, now, isPreview: preview.isPreview, previewAccount: preview.accounts.find(account => account.id === preview.selectedId) })));
+              h(UsageDetails, { snapshot: kind === 'codex' ? preview.detailSnapshot : snapshot, kind, model, modelName, now, isPreview: preview.isPreview, previewAccount: preview.accounts.find(account => account.id === preview.selectedId) })), document.body));
 
 
         }
