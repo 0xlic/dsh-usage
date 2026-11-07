@@ -18,7 +18,7 @@ window.__ModuleLoader__.load({
       },
     };
     const styles = `
-.dshUsage{order:1;display:inline-flex;align-items:center;flex-wrap:wrap;gap:4px 14px;min-width:0;max-width:100%;color:var(--dsw-alias-label-secondary);font:inherit;font-size:12px;line-height:20px;font-variant-numeric:tabular-nums;background:transparent;border:0;border-radius:6px;padding:1px 8px;min-height:24px;box-sizing:border-box;cursor:pointer;text-align:start;transition:background-color .12s,color .12s}
+.dshUsage{order:1;display:inline-flex;align-items:center;flex:0 1 auto;flex-wrap:nowrap;gap:14px;min-width:0;max-width:40%;overflow:hidden;white-space:nowrap;color:var(--dsw-alias-label-secondary);font:inherit;font-size:12px;line-height:20px;font-variant-numeric:tabular-nums;background:transparent;border:0;border-radius:6px;padding:1px 8px;min-height:24px;box-sizing:border-box;cursor:pointer;text-align:start;transition:background-color .12s,color .12s}
 .dshUsage:hover,.dshUsage[aria-expanded=true]{background:color-mix(in srgb,var(--dsw-alias-label-primary) 7%,var(--dsw-alias-bg-base));color:var(--dsw-alias-label-primary)}
 .dshUsage:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:2px}
 .dshUsagePopover{position:fixed;z-index:1200;box-sizing:border-box;width:min(360px,calc(100vw - 24px));height:auto;max-height:calc(100dvh - 24px);overflow:auto;padding:16px;border:1px solid var(--dsw-alias-border-l1);border-radius:12px;background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-secondary);box-shadow:0 6px 24px color-mix(in srgb,var(--dsw-alias-label-primary) 12%,transparent);font-family:inherit;font-size:13px;line-height:22px;font-variant-numeric:tabular-nums;text-align:start;outline:none}
@@ -40,10 +40,15 @@ window.__ModuleLoader__.load({
 .dshUsageClose{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;flex:none;border:0;border-radius:4px;background:transparent;color:var(--dsw-alias-label-secondary);cursor:pointer;font-size:18px;padding:0}
 .dshUsageClose:hover{background:var(--dsw-alias-bg-layer-2)}
 .dshUsageClose:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:1px}
-.dshUsageAccount{display:inline-flex;align-items:center;flex-wrap:wrap;gap:4px 9px;max-width:100%}
+/* Truncate a single inline text flow, not nested flex rows: the dock must
+   never grow taller or let usage monopolize the built-in session statistics. */
+.dshUsageContent{display:block;flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dshUsageAccount{display:inline;white-space:nowrap}
+.dshUsageAccount+.dshUsageAccount{margin-inline-start:14px}
 .dshUsageName{font-weight:400;max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.dshUsageWindow{display:inline-flex;align-items:center;gap:4px;white-space:nowrap}
-.dshUsageReset{opacity:.78}
+.dshUsageWindow{display:inline;white-space:nowrap}
+.dshUsageWindow+.dshUsageWindow{margin-inline-start:9px}
+.dshUsageReset{opacity:.78;margin-inline-start:4px}
 .dshUsageLow{color:var(--dsw-alias-state-warn-primary)}
 .dshUsageError{color:var(--dsw-alias-state-error-primary)}
 .dshUsageReason{color:var(--dsw-alias-label-secondary);opacity:.85;max-width:min(420px,60vw);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -308,7 +313,7 @@ window.__ModuleLoader__.load({
               'aria-label': `${providerTitle} · ${t('details')}`, 'aria-haspopup': 'dialog',
               'aria-expanded': open, 'aria-controls': open ? id : undefined,
               onClick: () => { setPosition(null); setOpen(value => !value); },
-            }, content),
+            }, h('span', { className: 'dshUsageContent' }, content)),
             // DSH 0.2.2 contains the docked composer. Keep viewport-positioned
             // details outside that containing block; React still owns cleanup.
             open && createPortal(h('div', {

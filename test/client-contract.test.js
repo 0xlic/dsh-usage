@@ -16,6 +16,27 @@ test('composer details use the shared React DOM portal outside the contained doc
   assert.match(source, /trigger\.contains\(event\.target\)/);
 });
 
+test('composer usage stays on one line and shares constrained dock space', async () => {
+  // Source contract only; actual ellipsis and dock height need browser checking.
+  const source = await read('../client.source.js');
+  const rule = name => source.match(new RegExp(`\\.${name}\\{([^}]+)\\}`))?.[1];
+  const trigger = rule('dshUsage');
+  assert.match(trigger, /flex:0 1 auto;/);
+  assert.match(trigger, /min-width:0;/);
+  assert.match(trigger, /max-width:40%;/);
+  assert.match(trigger, /flex-wrap:nowrap;/);
+  assert.match(trigger, /overflow:hidden;/);
+  assert.match(rule('dshUsageContent'), /text-overflow:ellipsis;/);
+  assert.match(rule('dshUsageContent'), /white-space:nowrap/);
+  assert.match(rule('dshUsageContent'), /min-width:0;/);
+  for (const name of ['dshUsageAccount', 'dshUsageWindow']) {
+    assert.match(rule(name), /display:inline;/);
+    assert.match(rule(name), /white-space:nowrap/);
+  }
+  assert.match(source, /h\('span', \{ className: 'dshUsageContent' \}, content\)/);
+  assert.doesNotMatch(source, /flex-wrap:wrap/);
+});
+
 test('shipped client artifact matches the source and shared logic', async () => {
   const source = await read('../client.source.js');
   const logic = (await read('../logic.js')).replace(/^export /gm, '');
