@@ -37,6 +37,14 @@ test('composer usage stays on one line and shares constrained dock space', async
   assert.doesNotMatch(source, /flex-wrap:wrap/);
 });
 
+test('all provider popover headers show provider and details text without usage values', async () => {
+  const source = await read('../client.source.js');
+  const header = source.slice(source.indexOf("h('div', { className: 'dshUsageHeader' }"), source.indexOf('              h(UsageDetails,'));
+  assert.match(header, /h\('span', \{ id: `\$\{id\}-title` \}, providerTitle\)/);
+  assert.match(header, /h\('span', \{ className: 'dshUsageSummary' \}, t\('details'\)\)/);
+  assert.doesNotMatch(header, /capinfoBalanceView|formatWalletAmount|snapshot|\.totals|remainingPercent/);
+});
+
 test('shipped client artifact matches the source and shared logic', async () => {
   const source = await read('../client.source.js');
   const logic = (await read('../logic.js')).replace(/^export /gm, '');

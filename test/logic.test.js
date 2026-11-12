@@ -18,7 +18,8 @@ test('detail reset countdown splits days, hours and minutes and handles elapsed 
   assert.equal(resetCountdown(null, now), null);
 });
 test('billing identity follows provider, not model name', () => {
-  assert.equal(usageKind('openai-codex'), 'codex');
+  assert.equal(usageKind(`codex-sub-${'a'.repeat(32)}`), 'codex');
+  assert.equal(usageKind('openai-codex'), null);
   assert.equal(usageKind('deepseek-account'), 'deepseek');
   assert.equal(usageKind('deepseek-official'), null);
   assert.equal(usageKind('custom'), null);
@@ -137,4 +138,44 @@ test('failure text is single-line and bounded for a tooltip', async () => {
   assert.equal(store.getSnapshot().error.startsWith('bad name'), true);
   assert.equal(store.getSnapshot().error.length, 300);
   off(); store.dispose();
+});
+
+test('timer, manual refresh and foreground wake request fresh upstream data', async () => {
+  let timer, shown = true;
+  const requests = [];
+  const store = createUsageStore(async (signal, options) => { requests.push(options); return requests.length; }, {
+    visible: () => shown, schedule: fn => { timer = fn; return 1; }, cancel: () => { timer = undefined; },
+  });
+  const off = store.subscribe(() => {});
+  await tick();
+  assert.equal(requests[0].force, true);
+  await store.refresh({ force: true, reason: 'manual' });
+  assert.equal(requests.at(-1).reason, 'manual');
+  timer(); await tick();
+  assert.equal(requests.at(-1).force, true);
+  shown = false; store.wake();
+  const count = requests.length;
+  assert.equal(timer, undefined);
+  await store.refresh();
+  assert.equal(requests.length, count);
+  shown = true; store.wake(); await tick();
+  assert.equal(requests.length, count + 1);
+  off(); store.dispose();
+});
+
+test('different provider/model stores never share snapshots and remount refreshes', async () => {
+  let reads = 0;
+  const options = { schedule: () => 1, cancel: () => {} };
+  const a = createUsageStore(async () => ({ provider: 'a', reads: ++reads }), options);
+  const b = createUsageStore(async () => ({ provider: 'b', reads: ++reads }), options);
+  const offA = a.subscribe(() => {}), offB = b.subscribe(() => {});
+  await tick();
+  assert.equal(a.getSnapshot().value.provider, 'a');
+  assert.equal(b.getSnapshot().value.provider, 'b');
+  offA();
+  const before = reads;
+  const offAgain = a.subscribe(() => {});
+  await tick();
+  assert.equal(reads, before + 1);
+  offAgain(); offB(); a.dispose(); b.dispose();
 });

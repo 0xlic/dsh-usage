@@ -1,8 +1,9 @@
 // Model-specific limit matching follows dsh-codex-subscription 3.2.5's
 // selectModelQuotaWindows semantics. Original implementation here is MIT.
 export function usageKind(provider) {
-  if (provider === 'openai-codex') return 'codex';
+  if (/^codex-sub-[a-f0-9]{32}$/.test(provider ?? '')) return 'codex';
   if (provider === 'deepseek-account') return 'deepseek';
+  if (provider === 'capinfo') return 'capinfo';
   // An API-key route is not billed to the signed-in DSH account.
   return null;
 }
@@ -65,44 +66,6 @@ export function accountRows(status, allUsage, includeInactive = false) {
   })).filter(account => includeInactive || account.active);
 }
 
-export function nextPreviewAccountId(accounts, previewId, activeId) {
-  if (!accounts.length) return null;
-  const current = accounts.findIndex(account => account.id === (previewId || activeId));
-  return accounts[(current + 1) % accounts.length].id;
-}
-
-export function codexPreviewState(activeSnapshot, previewSnapshot, previewId) {
-  const value = activeSnapshot.status === 'ready' ? activeSnapshot.value : null;
-  const accounts = value?.accounts ?? [];
-  const activeId = value?.rows?.find(account => account.active)?.id ?? null;
-  const selectedId = accounts.some(account => account.id === previewId) ? previewId : activeId;
-  const isPreview = !!selectedId && !!activeId && selectedId !== activeId;
-  if (!isPreview) return { accounts, activeId, selectedId, isPreview: false, detailSnapshot: activeSnapshot };
-  if (previewSnapshot.status !== 'ready') return { accounts, activeId, selectedId, isPreview, detailSnapshot: previewSnapshot };
-  const selected = previewSnapshot.value?.rows?.find(account => account.id === selectedId);
-  const detailSnapshot = selected ? { status: 'ready', value: { rows: [selected] } } : { status: 'failed', value: null, error: 'account-removed' };
-  return { accounts, activeId, selectedId, isPreview, detailSnapshot };
-}
-
-// Reuse the subscription plugin's Host operation; never select a GPT model or
-// modify credentials ourselves. This is called only by the user's check button.
-export async function activateCodexAccount(call, id, expectedActiveId, signal) {
-  const fail = code => { throw Object.assign(new Error(code), { code }); };
-  const activeIdOf = status => status.accounts?.find(account => account.active)?.id ?? (status.accounts?.length === 1 ? status.accounts[0].id : null);
-  signal?.throwIfAborted();
-  const before = await call('status', {}, signal);
-  signal?.throwIfAborted();
-  if (!before?.authenticated || !before.accounts?.some(account => account.id === id)) fail('account-removed');
-  const currentId = activeIdOf(before);
-  if (currentId === id) return before;
-  if (currentId !== expectedActiveId) fail('active-account-changed');
-  await call('account/select', { id }, signal);
-  signal?.throwIfAborted();
-  const after = await call('status', {}, signal);
-  if (!after?.authenticated || activeIdOf(after) !== id) fail('account-selection-unconfirmed');
-  return after;
-}
-
 // Exact decimal addition: bonus wallets are separate from recharge wallets.
 // Currency values remain strings, with no binary floating-point summation.
 export function walletTotals(balance) {
@@ -139,8 +102,24 @@ export function formatWalletAmount({ currency, amount }) {
   return `${symbol}${negative && cents !== 0n ? '-' : ''}${cents / 100n}.${String(cents % 100n).padStart(2, '0')}`;
 }
 
+// Never present retained historical data as current API-key quota.
+export function capinfoBalanceView(balance, now = Date.now()) {
+  const updatedAt = typeof balance?.updatedAt === 'string' ? Date.parse(balance.updatedAt) : NaN;
+  const base = { amount: '¥--', updatedAt: Number.isFinite(updatedAt) ? updatedAt : null };
+  const status = balance?.status;
+  if (status !== 'ready') return { ...base, reason: ({ pending: 'loading', unconfigured: 'keyRequired', unavailable: 'balanceUnavailable', error: 'failed', missing: 'capinfoMissing' })[status] || 'failed' };
+  if (!Number.isFinite(updatedAt) || now - updatedAt > 120000 || updatedAt > now + 60000) return { ...base, reason: 'balanceStale' };
+  const data = balance.data;
+  if (data?.isValid === false) return { ...base, reason: 'keyInvalid' };
+  if (data?.isValid !== true || data.unit !== 'CNY' || typeof data.unlimited !== 'boolean' || !Number.isFinite(data.used) ||
+      (data.unlimited ? data.remaining !== null || data.total !== null : !Number.isFinite(data.remaining) || !Number.isFinite(data.total))) return { ...base, reason: 'failed' };
+  const money = value => `¥${value.toFixed(2)}`;
+  return { ...base, reason: null, amount: data.unlimited ? '¥∞' : money(data.remaining),
+    total: data.unlimited ? '¥∞' : money(data.total), used: money(data.used) };
+}
+
 export function usageProviderTitle(kind, providerName) {
-  return kind === 'codex' ? 'Codex' : kind === 'deepseek' ? 'DeepSeek' : providerName || kind;
+  return kind === 'codex' ? 'Codex' : kind === 'deepseek' ? 'DeepSeek' : providerName || (kind === 'capinfo' ? 'Capinfo' : kind);
 }
 
 export function formatUsageDate(milliseconds, locale = 'zh-CN', timeZone) {
@@ -161,7 +140,17 @@ export function usagePopoverPosition(anchor, panel, viewport) {
   return { left, top };
 }
 
-// One shared read loop per provider, irrespective of mounted Session count.
+// Observe owner state, never intercept model selection or patch its controls.
+export function observeModelSelection(directory, onSelected) {
+  let pending = !!directory.getSnapshot().pending;
+  return directory.subscribe(() => {
+    const next = directory.getSnapshot();
+    if (pending && !next.pending && next.status === 'ready') onSelected();
+    pending = !!next.pending;
+  });
+}
+
+// One shared read loop per provider/model, irrespective of mounted Session count.
 // Abort + generation checks prevent late account/session responses resurfacing.
 export function createUsageStore(request, { visible = () => true, schedule = setTimeout, cancel = clearTimeout, interval = 60000, onError = () => {} } = {}) {
   let snapshot = { status: 'loading', value: null };
@@ -170,12 +159,12 @@ export function createUsageStore(request, { visible = () => true, schedule = set
   const publish = next => { snapshot = next; for (const listener of listeners) listener(); };
   const stop = () => { if (timer !== undefined) cancel(timer); timer = undefined; };
   const queue = () => { stop(); if (!closed && listeners.size && visible()) timer = schedule(() => { timer = undefined; refresh(); }, interval); };
-  const refresh = () => {
+  const refresh = (options = { force: true, reason: 'timer' }) => {
     if (closed || !listeners.size || !visible() || flight) return flight?.promise;
     stop();
     const own = { generation, controller: new AbortController() };
     flight = own;
-    own.promise = Promise.resolve().then(() => request(own.controller.signal)).then(value => {
+    own.promise = Promise.resolve().then(() => request(own.controller.signal, options)).then(value => {
       if (!closed && own.generation === generation) publish({ status: 'ready', value });
     }).catch(error => {
       if (!closed && own.generation === generation) {

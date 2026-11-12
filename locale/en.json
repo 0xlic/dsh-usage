@@ -1,1 +1,1 @@
-{"meta":{"title":"Account Usage · dsh-usage","description":"Appends model-aware active Codex account quotas and reset countdowns or the built-in DeepSeek account balance below the composer, with clickable details, Codex account previews, and explicit account activation."}}
+{"meta":{"title":"Account usage","description":"Independent Codex quotas, DeepSeek account balances and Capinfo quota with shared caching, periodic refresh, model-selection refresh and manual refresh."}}

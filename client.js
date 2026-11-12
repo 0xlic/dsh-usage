@@ -8,8 +8,9 @@ window.__ModuleLoader__.load({
     // Model-specific limit matching follows dsh-codex-subscription 3.2.5's
 // selectModelQuotaWindows semantics. Original implementation here is MIT.
 function usageKind(provider) {
-  if (provider === 'openai-codex') return 'codex';
+  if (/^codex-sub-[a-f0-9]{32}$/.test(provider ?? '')) return 'codex';
   if (provider === 'deepseek-account') return 'deepseek';
+  if (provider === 'capinfo') return 'capinfo';
   // An API-key route is not billed to the signed-in DSH account.
   return null;
 }
@@ -72,44 +73,6 @@ function accountRows(status, allUsage, includeInactive = false) {
   })).filter(account => includeInactive || account.active);
 }
 
-function nextPreviewAccountId(accounts, previewId, activeId) {
-  if (!accounts.length) return null;
-  const current = accounts.findIndex(account => account.id === (previewId || activeId));
-  return accounts[(current + 1) % accounts.length].id;
-}
-
-function codexPreviewState(activeSnapshot, previewSnapshot, previewId) {
-  const value = activeSnapshot.status === 'ready' ? activeSnapshot.value : null;
-  const accounts = value?.accounts ?? [];
-  const activeId = value?.rows?.find(account => account.active)?.id ?? null;
-  const selectedId = accounts.some(account => account.id === previewId) ? previewId : activeId;
-  const isPreview = !!selectedId && !!activeId && selectedId !== activeId;
-  if (!isPreview) return { accounts, activeId, selectedId, isPreview: false, detailSnapshot: activeSnapshot };
-  if (previewSnapshot.status !== 'ready') return { accounts, activeId, selectedId, isPreview, detailSnapshot: previewSnapshot };
-  const selected = previewSnapshot.value?.rows?.find(account => account.id === selectedId);
-  const detailSnapshot = selected ? { status: 'ready', value: { rows: [selected] } } : { status: 'failed', value: null, error: 'account-removed' };
-  return { accounts, activeId, selectedId, isPreview, detailSnapshot };
-}
-
-// Reuse the subscription plugin's Host operation; never select a GPT model or
-// modify credentials ourselves. This is called only by the user's check button.
-async function activateCodexAccount(call, id, expectedActiveId, signal) {
-  const fail = code => { throw Object.assign(new Error(code), { code }); };
-  const activeIdOf = status => status.accounts?.find(account => account.active)?.id ?? (status.accounts?.length === 1 ? status.accounts[0].id : null);
-  signal?.throwIfAborted();
-  const before = await call('status', {}, signal);
-  signal?.throwIfAborted();
-  if (!before?.authenticated || !before.accounts?.some(account => account.id === id)) fail('account-removed');
-  const currentId = activeIdOf(before);
-  if (currentId === id) return before;
-  if (currentId !== expectedActiveId) fail('active-account-changed');
-  await call('account/select', { id }, signal);
-  signal?.throwIfAborted();
-  const after = await call('status', {}, signal);
-  if (!after?.authenticated || activeIdOf(after) !== id) fail('account-selection-unconfirmed');
-  return after;
-}
-
 // Exact decimal addition: bonus wallets are separate from recharge wallets.
 // Currency values remain strings, with no binary floating-point summation.
 function walletTotals(balance) {
@@ -146,8 +109,24 @@ function formatWalletAmount({ currency, amount }) {
   return `${symbol}${negative && cents !== 0n ? '-' : ''}${cents / 100n}.${String(cents % 100n).padStart(2, '0')}`;
 }
 
+// Never present retained historical data as current API-key quota.
+function capinfoBalanceView(balance, now = Date.now()) {
+  const updatedAt = typeof balance?.updatedAt === 'string' ? Date.parse(balance.updatedAt) : NaN;
+  const base = { amount: '¥--', updatedAt: Number.isFinite(updatedAt) ? updatedAt : null };
+  const status = balance?.status;
+  if (status !== 'ready') return { ...base, reason: ({ pending: 'loading', unconfigured: 'keyRequired', unavailable: 'balanceUnavailable', error: 'failed', missing: 'capinfoMissing' })[status] || 'failed' };
+  if (!Number.isFinite(updatedAt) || now - updatedAt > 120000 || updatedAt > now + 60000) return { ...base, reason: 'balanceStale' };
+  const data = balance.data;
+  if (data?.isValid === false) return { ...base, reason: 'keyInvalid' };
+  if (data?.isValid !== true || data.unit !== 'CNY' || typeof data.unlimited !== 'boolean' || !Number.isFinite(data.used) ||
+      (data.unlimited ? data.remaining !== null || data.total !== null : !Number.isFinite(data.remaining) || !Number.isFinite(data.total))) return { ...base, reason: 'failed' };
+  const money = value => `¥${value.toFixed(2)}`;
+  return { ...base, reason: null, amount: data.unlimited ? '¥∞' : money(data.remaining),
+    total: data.unlimited ? '¥∞' : money(data.total), used: money(data.used) };
+}
+
 function usageProviderTitle(kind, providerName) {
-  return kind === 'codex' ? 'Codex' : kind === 'deepseek' ? 'DeepSeek' : providerName || kind;
+  return kind === 'codex' ? 'Codex' : kind === 'deepseek' ? 'DeepSeek' : providerName || (kind === 'capinfo' ? 'Capinfo' : kind);
 }
 
 function formatUsageDate(milliseconds, locale = 'zh-CN', timeZone) {
@@ -168,7 +147,17 @@ function usagePopoverPosition(anchor, panel, viewport) {
   return { left, top };
 }
 
-// One shared read loop per provider, irrespective of mounted Session count.
+// Observe owner state, never intercept model selection or patch its controls.
+function observeModelSelection(directory, onSelected) {
+  let pending = !!directory.getSnapshot().pending;
+  return directory.subscribe(() => {
+    const next = directory.getSnapshot();
+    if (pending && !next.pending && next.status === 'ready') onSelected();
+    pending = !!next.pending;
+  });
+}
+
+// One shared read loop per provider/model, irrespective of mounted Session count.
 // Abort + generation checks prevent late account/session responses resurfacing.
 function createUsageStore(request, { visible = () => true, schedule = setTimeout, cancel = clearTimeout, interval = 60000, onError = () => {} } = {}) {
   let snapshot = { status: 'loading', value: null };
@@ -177,12 +166,12 @@ function createUsageStore(request, { visible = () => true, schedule = setTimeout
   const publish = next => { snapshot = next; for (const listener of listeners) listener(); };
   const stop = () => { if (timer !== undefined) cancel(timer); timer = undefined; };
   const queue = () => { stop(); if (!closed && listeners.size && visible()) timer = schedule(() => { timer = undefined; refresh(); }, interval); };
-  const refresh = () => {
+  const refresh = (options = { force: true, reason: 'timer' }) => {
     if (closed || !listeners.size || !visible() || flight) return flight?.promise;
     stop();
     const own = { generation, controller: new AbortController() };
     flight = own;
-    own.promise = Promise.resolve().then(() => request(own.controller.signal)).then(value => {
+    own.promise = Promise.resolve().then(() => request(own.controller.signal, options)).then(value => {
       if (!closed && own.generation === generation) publish({ status: 'ready', value });
     }).catch(error => {
       if (!closed && own.generation === generation) {
@@ -215,12 +204,14 @@ function createUsageStore(request, { visible = () => true, schedule = setTimeout
 
     const dictionaries = {
       en: {
-        cycleAccount: 'Preview next account', applyAccount: 'Activate previewed account', previewAccount: 'Previewed account', applying: 'Activating…', applyFailed: 'Could not activate this account. Please retry.', 'account-removed': 'This account is no longer available. Refresh and retry.', 'active-account-changed': 'The active account changed elsewhere. Review and retry.', 'account-selection-unconfirmed': 'Account activation could not be confirmed. Please retry.',
+        refresh: 'Refresh usage', refreshing: 'Refreshing…',
+        keyBalance: 'Account balance', keyTotal: 'Total quota', keyUsed: 'Used quota', keyRequired: 'API key not configured', keyInvalid: 'API key is unavailable', balanceUnavailable: 'Balance endpoint unavailable; retrying automatically', balanceStale: 'Balance data is outdated', capinfoMissing: 'Capinfo balance service unavailable',
         details: 'Usage details', model: 'Model', account: 'Current account', total: 'Total balance', recharge: 'Recharge balance', bonus: 'Bonus balance', fiveHour: '5-hour quota', sevenDay: '7-day quota', quota: 'quota', resetAt: 'Resets at', updatedAt: 'Updated at', refreshIn: 'Refresh in', countdown: '{days} days {hours} hours {minutes} minutes', unknownTime: 'Not reported', remainingValue: '{value}% remaining', close: 'Close usage details',
         label: 'Account usage', loading: 'Loading…', failed: 'Usage unavailable', signedOut: 'Not signed in', empty: 'No quota reported', remaining: 'remaining', active: 'current account', due: 'awaiting reset', balance: 'Account balance (recharge + bonus)', unsupported: 'This route does not use the DSH account balance',
       },
       zh: {
-        cycleAccount: '切换预览账号', applyAccount: '启用此账号', previewAccount: '预览账号', applying: '正在启用…', applyFailed: '账号启用失败，请重试。', 'account-removed': '该账号已不可用，请刷新后重试。', 'active-account-changed': '活动账号已在其他位置更改，请核对后重试。', 'account-selection-unconfirmed': '暂时无法确认账号是否启用，请重试。',
+        refresh: '刷新用量', refreshing: '正在刷新…',
+        keyBalance: '账户余额', keyTotal: '总额度', keyUsed: '已用额度', keyRequired: '未配置 API 密钥', keyInvalid: 'API Key 当前不可用', balanceUnavailable: '余额接口暂不可用，将自动重试', balanceStale: '余额数据已过期', capinfoMissing: 'Capinfo 余额服务未启用或不可用',
         details: '用量详情', model: '当前模型', account: '当前账号', total: '账户总余额', recharge: '充值余额', bonus: '赠金余额', fiveHour: '5 小时限额', sevenDay: '7 天限额', quota: '限额', resetAt: '重置时间', updatedAt: '数据更新时间', refreshIn: '刷新时间', countdown: '{days} 天 {hours} 小时 {minutes} 分', unknownTime: '暂未提供', remainingValue: '剩余 {value}%', close: '关闭用量详情',
         label: '账户用量', loading: '读取中…', failed: '用量暂不可用', signedOut: '未登录', empty: '暂无额度数据', remaining: '剩余', active: '当前账号', due: '等待重置', balance: '账户余额（充值 + 赠送）', unsupported: '此路由不使用 DSH 账户余额',
       },
@@ -266,119 +257,66 @@ function createUsageStore(request, { visible = () => true, schedule = setTimeout
       return result.value;
     };
     return {
-      inject: ['slots', 'locale', 'connection', 'remote', 'modelDirectories'],
+      inject: ['slots', 'locale', 'modelDirectories', 'configForms'],
       apply(ctx) {
         ctx.effect(() => ctx.locale.register('dsh-usage', dictionaries));
         const t = ctx.locale.bind('dsh-usage');
-        const connection = ctx.get('connection');
-        /* Resolved per read, not once at apply time: the account namespace is a
-           `remote.account` child service that may mount after this plugin. */
-        const accountService = () => ctx.get('remote.account') ?? ctx.get('remote')?.account;
         const directories = ctx.get('modelDirectories');
         const locale = ctx.get('locale');
+        const chatSettings = ctx.get('configForms').get('ui-chat');
+        const subscribePerformanceUsage = listener => chatSettings.subscribe(listener);
+        const getPerformanceUsage = () => chatSettings.getSnapshot().value?.performanceUsage ?? 'detailed';
         const visible = () => document.visibilityState !== 'hidden';
-        async function codexCall(endpoint, signal, payload = { force: false }) {
-          return unwrap(await connection.rpc.call('/api', `codex-subscription/${endpoint}`, payload, signal));
+        async function readHostUsage(kind, provider, model, signal, options) {
+          const response = await fetch('/api/plugins/usage/read', {
+            method: 'POST', credentials: 'same-origin', cache: 'no-store',
+            headers: { 'Content-Type': 'application/json' }, signal,
+            body: JSON.stringify({
+              kind, provider, model, force: options?.force === true,
+              ...(kind === 'deepseek' ? { client: { version: '0.2.2-rc.1', locale: locale.getSnapshot().active,
+                timezoneOffsetSeconds: -new Date().getTimezoneOffset() * 60 } } : {}),
+            }),
+          });
+          if (!response.ok) throw new Error('Usage query failed');
+          return unwrap(await response.json());
         }
-        const identity = status => JSON.stringify([status?.authenticated, ...(status?.accounts ?? []).map(a => [a.id, a.active])]);
-        async function readCodex(signal) {
-          const timeout = new AbortController();
-          const abort = () => timeout.abort();
-          signal.addEventListener('abort', abort, { once: true });
-          if (signal.aborted) abort();
-          const timer = setTimeout(abort, 30000);
-          try {
-            const status = await codexCall('status', timeout.signal);
-            if (!status?.authenticated) return { signedOut: true, rows: [], accounts: [] };
-            const usage = await codexCall('usage', timeout.signal);
-            const after = await codexCall('status', timeout.signal);
-            if (identity(status) !== identity(after)) throw new Error('Account changed');
-            const accounts = after.accounts ?? [];
-            const active = accounts.find(account => account.active === true) ?? (accounts.length === 1 ? accounts[0] : null);
-            return {
-              rows: accountRows(after, { accounts: active ? [{ id: active.id, usage }] : [] }),
-              accounts: accountRows(after, { accounts: [] }, true),
-            };
-          } finally { clearTimeout(timer); signal.removeEventListener('abort', abort); }
+        const stores = new Map();
+        function storeFor(kind, provider, model) {
+          const key = JSON.stringify([kind, provider, model]);
+          if (!stores.has(key)) stores.set(key, createUsageStore(
+            (signal, options) => readHostUsage(kind, provider, model, signal, options),
+            { visible, onError: () => console.error(`[dsh-usage] ${kind} query failed`) }));
+          return stores.get(key);
         }
-        // Only retained while a multi-account Codex details popup is open.
-        // This read-only endpoint never changes the account used by inference.
-        async function readCodexPreview(signal) {
-          const timeout = new AbortController();
-          const abort = () => timeout.abort();
-          signal.addEventListener('abort', abort, { once: true });
-          if (signal.aborted) abort();
-          const timer = setTimeout(abort, 30000);
-          try {
-            const status = await codexCall('status', timeout.signal);
-            if (!status?.authenticated) return { signedOut: true, rows: [] };
-            const usage = await codexCall('usage/accounts', timeout.signal);
-            const after = await codexCall('status', timeout.signal);
-            if (identity(status) !== identity(after)) throw new Error('active-account-changed');
-            return { rows: accountRows(after, usage, true) };
-          } finally { clearTimeout(timer); signal.removeEventListener('abort', abort); }
-        }
-        async function readDeepSeek(signal) {
-          const account = accountService();
-          if (!account) throw new Error('Account service unavailable');
-          const client = {
-            version: '0.2.1-rc.5',
-            locale: locale.getSnapshot().active,
-            timezoneOffsetSeconds: -new Date().getTimezoneOffset() * 60,
-          };
-          const state = unwrap(await account.getState());
-          if (state?.status !== 'credential-stored') return { signedOut: true, totals: [] };
-          let timer;
-          const balance = await Promise.race([
-            Promise.resolve().then(() => account.getBalance(client)).then(unwrap),
-            new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('Balance query timed out')), 20000); }),
-          ]).finally(() => clearTimeout(timer));
-          if (signal.aborted) throw new Error('Cancelled');
-          if (balance === null) return { signedOut: true, totals: [] };
-          if (balance.status !== 'ready') throw new Error('Platform balance query failed');
-          return {
-            totals: walletTotals(balance),
-            recharge: walletTotals({ status: 'ready', value: balance.value }),
-            bonus: walletTotals({ status: 'ready', value: balance.bonusWallets }),
-            updatedAt: Date.now(),
-          };
-        }
-        const stores = {
-          codex: createUsageStore(readCodex, { visible, onError: error => console.error('[dsh-usage] codex', error?.message ?? error) }),
-          codexPreview: createUsageStore(readCodexPreview, { visible, onError: error => console.error('[dsh-usage] codex preview', error?.message ?? error) }),
-          deepseek: createUsageStore(readDeepSeek, { visible, onError: error => console.error('[dsh-usage] deepseek', error?.message ?? error) }),
-        };
+        ctx.on('connection/reset', () => stores.forEach(store => store.invalidate()));
         ctx.effect(() => {
-          const wake = () => Object.values(stores).forEach(store => store.wake());
-          const invalidateCodex = () => { stores.codex.invalidate(); stores.codexPreview.invalidate(); };
+          const wake = () => stores.forEach(store => store.wake());
           document.addEventListener('visibilitychange', wake);
           window.addEventListener('focus', wake);
-          // This is the account-change notification used by the existing plugin.
-          window.addEventListener('dsh-codex-subscription:refresh-quick-quota', invalidateCodex);
           return () => {
             document.removeEventListener('visibilitychange', wake);
             window.removeEventListener('focus', wake);
-            window.removeEventListener('dsh-codex-subscription:refresh-quick-quota', invalidateCodex);
-            Object.values(stores).forEach(store => store.dispose());
+            stores.forEach(store => store.dispose());
+            stores.clear();
           };
         });
-        const idlePreview = Object.freeze({ status: 'loading', value: null });
-        const idleSubscribe = () => () => {};
-        const getIdlePreview = () => idlePreview;
-        function useCodexPreview(enabled) {
-          return React.useSyncExternalStore(
-            enabled ? stores.codexPreview.subscribe : idleSubscribe,
-            enabled ? stores.codexPreview.getSnapshot : getIdlePreview,
-            getIdlePreview);
-        }
         const detailError = error => Object.hasOwn(dictionaries.en, error) ? t(error) : error;
         function DetailRow({ label, children }) {
           return h('div', { className: 'dshUsageDetailRow' }, h('span', { className: 'dshUsageDetailLabel' }, label), h('span', { className: 'dshUsageDetailValue' }, children));
         }
-        function UsageDetails({ snapshot, kind, model, modelName, now, isPreview, previewAccount }) {
+        function UsageDetails({ snapshot, kind, model, modelName, now }) {
+          // Capinfo failures, pending reads and stale data share a quiet placeholder UI.
+          if (kind === 'capinfo') {
+            const balance = capinfoBalanceView(snapshot.status === 'ready' ? snapshot.value : null, now);
+            return h(React.Fragment, null,
+              h(DetailRow, { label: t('model') }, modelName || model),
+              h(DetailRow, { label: t('keyBalance') }, balance.amount),
+              h(DetailRow, { label: t('keyTotal') }, balance.total || '¥--'),
+              h(DetailRow, { label: t('keyUsed') }, balance.used || '¥--'),
+              h('div', { className: 'dshUsageUpdated' }, h(DetailRow, { label: t('updatedAt') },
+                balance.reason ? '--' : formatUsageDate(balance.updatedAt, locale.getSnapshot().active) || '--')));
+          }
           if (snapshot.status !== 'ready') return h(React.Fragment, null,
-            isPreview && previewAccount && h(DetailRow, { label: t('previewAccount') }, previewAccount.label),
-            isPreview && previewAccount?.email && h('div', { className: 'dshUsageDetailNote' }, previewAccount.email),
             h('div', { className: 'dshUsageDetailNote' }, t(snapshot.status === 'failed' ? 'failed' : 'loading'), snapshot.error ? ` · ${detailError(snapshot.error)}` : ''));
           const value = snapshot.value;
           if (value.signedOut) return h('div', { className: 'dshUsageDetailNote' }, t('signedOut'));
@@ -398,7 +336,7 @@ function createUsageStore(request, { visible = () => true, schedule = setTimeout
             h('div', { className: 'dshUsageUpdated' }, h(DetailRow, { label: t('updatedAt') }, date(value.updatedAt))));
           return h(React.Fragment, null, modelRow,
             value.rows.length ? value.rows.map(account => h('div', { key: account.id },
-              h(DetailRow, { label: t(isPreview ? 'previewAccount' : 'account') }, account.label),
+              h(DetailRow, { label: t('account') }, account.label),
               account.failed && h('div', { className: 'dshUsageActionError' }, `${t('failed')} · ${account.error || t('empty')}`),
               account.email && h('div', { className: 'dshUsageDetailNote' }, account.email),
               quotaWindows(account.usage, model).map(w => h('div', { className: 'dshUsageQuotaBlock', key: w.windowSeconds },
@@ -410,59 +348,35 @@ function createUsageStore(request, { visible = () => true, schedule = setTimeout
               !quotaWindows(account.usage, model).length && h('div', { className: 'dshUsageDetailNote' }, t('empty')),
               h('div', { className: 'dshUsageUpdated' }, h(DetailRow, { label: t('updatedAt') }, date(account.usage?.fetchedAt))))) : h('div', null, t('empty')));
         }
-        function UsageValue({ kind, model, modelName, providerName }) {
-          const store = stores[kind];
+        function UsageValue({ kind, provider, model, modelName, providerName, selectionRevision }) {
+          const performanceUsage = React.useSyncExternalStore(subscribePerformanceUsage, getPerformanceUsage, getPerformanceUsage);
+          const store = storeFor(kind, provider, model);
           const snapshot = React.useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
           const [now, setNow] = React.useState(Date.now);
           const [open, setOpen] = React.useState(false);
-          const [previewId, setPreviewId] = React.useState(null);
-          const [applying, setApplying] = React.useState(false);
-          const [actionError, setActionError] = React.useState(null);
-          const actionRef = React.useRef(null), mountedRef = React.useRef(false), cycleRef = React.useRef(null);
-          const previewEnabled = open && kind === 'codex' && snapshot.status === 'ready' && (snapshot.value.accounts?.length ?? 0) > 1;
-          const previewSnapshot = useCodexPreview(previewEnabled);
-          const preview = codexPreviewState(snapshot, previewSnapshot, previewId);
+          const [refreshing, setRefreshing] = React.useState(false);
+          const mountedRef = React.useRef(false);
+          const previousRevision = React.useRef(selectionRevision);
+          React.useEffect(() => {
+            if (previousRevision.current !== selectionRevision) store.invalidate();
+            previousRevision.current = selectionRevision;
+          }, [store, selectionRevision]);
+          const refresh = async () => {
+            if (refreshing) return;
+            setRefreshing(true);
+            try { await store.refresh({ force: true, reason: 'manual' }); }
+            finally { if (mountedRef.current) { setRefreshing(false); setNow(Date.now()); } }
+          };
           const [position, setPosition] = React.useState(null);
           const triggerRef = React.useRef(null), panelRef = React.useRef(null);
           const id = React.useId();
           const providerTitle = usageProviderTitle(kind, providerName);
           const close = restoreFocus => { setOpen(false); if (restoreFocus) triggerRef.current?.focus(); };
-          React.useEffect(() => { setOpen(false); setPosition(null); setPreviewId(null); setActionError(null); }, [kind, model]);
-          React.useEffect(() => { if (!open) { setPreviewId(null); setActionError(null); } }, [open]);
+          React.useEffect(() => { setOpen(false); setPosition(null); }, [kind, provider, model]);
           React.useEffect(() => {
             mountedRef.current = true;
-            return () => { mountedRef.current = false; actionRef.current?.abort(); };
+            return () => { mountedRef.current = false; };
           }, []);
-          const cycleAccount = () => {
-            if (actionRef.current) return;
-            setActionError(null);
-            setPreviewId(nextPreviewAccountId(preview.accounts, preview.selectedId, preview.activeId));
-          };
-          // Selecting a billing/credential identity requires the user's explicit
-          // check-mark confirmation. No model tool auto-activates an account.
-          const applyAccount = async () => {
-            if (kind !== 'codex' || !open || !preview.isPreview || actionRef.current) return;
-            const controller = new AbortController();
-            actionRef.current = controller;
-            setApplying(true); setActionError(null);
-            const timer = setTimeout(() => controller.abort(), 30000);
-            try {
-              await activateCodexAccount((endpoint, payload, signal) => codexCall(endpoint, signal, payload), preview.selectedId, preview.activeId, controller.signal);
-              if (mountedRef.current) { setPreviewId(null); cycleRef.current?.focus(); }
-            } catch (error) {
-              if (mountedRef.current) setActionError(t(['account-removed', 'active-account-changed', 'account-selection-unconfirmed'].includes(error?.code) ? error.code : 'applyFailed'));
-            } finally {
-              clearTimeout(timer);
-              actionRef.current = null;
-              if (mountedRef.current) {
-                setApplying(false);
-                // Reconcile even after a transport error: the Host may already
-                // have committed the switch. Reuse the original quota event.
-                window.dispatchEvent(new Event('dsh-codex-subscription:refresh-quick-quota'));
-                panelRef.current?.focus({ preventScroll: true });
-              }
-            }
-          };
           React.useLayoutEffect(() => {
             if (!open) return;
             const panel = panelRef.current, trigger = triggerRef.current;
@@ -492,18 +406,22 @@ function createUsageStore(request, { visible = () => true, schedule = setTimeout
             };
           }, [open]);
           React.useEffect(() => {
-            if (kind !== 'codex') return;
+            if (kind !== 'codex' && kind !== 'capinfo') return;
             const timer = setInterval(() => setNow(Date.now()), 15000);
             return () => clearInterval(timer);
           }, [kind]);
           let content;
-          if (snapshot.status !== 'ready') content = h('span', { className: snapshot.status === 'failed' ? 'dshUsageError' : undefined, title: snapshot.error },
+          if (kind === 'capinfo') content = h('span', { title: t('keyBalance') },
+            capinfoBalanceView(snapshot.status === 'ready' ? snapshot.value : null, now).amount);
+          else if (snapshot.status !== 'ready') content = h('span', { className: snapshot.status === 'failed' ? 'dshUsageError' : undefined, title: snapshot.error },
             `${kind} ${t(snapshot.status === 'failed' ? 'failed' : 'loading')}`,
             snapshot.status === 'failed' && snapshot.error && h('span', { className: 'dshUsageReason' }, `（${snapshot.error.slice(0, 48)}）`));
           else if (snapshot.value.signedOut) content = h('span', null, `${kind} ${t('signedOut')}`);
           else if (kind === 'deepseek') content = h('span', { title: t('balance') }, snapshot.value.totals.map(formatWalletAmount).join(' · ') || t('empty'));
           else content = snapshot.value.rows.length ? snapshot.value.rows.map(account => {
-            const windows = quotaWindows(account.usage, model);
+            // Only the dock summary is compacted; the popover keeps every quota window.
+            const windows = quotaWindows(account.usage, model)
+              .filter(w => performanceUsage !== 'compact' || windowLabel(w.windowSeconds) !== '7day');
             const title = [account.label, account.email, account.active ? t('active') : '', t('remaining'), account.error].filter(Boolean).join(' · ');
             return h('span', { className: 'dshUsageAccount', key: account.id, title },
               account.failed ? h('span', { className: 'dshUsageError' }, t('failed')) : windows.length ? windows.map(w => {
@@ -534,19 +452,13 @@ function createUsageStore(request, { visible = () => true, schedule = setTimeout
                   h('ellipse', { cx: 10, cy: 4, rx: 6, ry: 2.5 }),
                   h('path', { d: 'M4 4v11c0 3.3 12 3.3 12 0V4M4 9c0 3.3 12 3.3 12 0' })),
                 h('span', { id: `${id}-title` }, providerTitle),
-                kind === 'codex' && preview.accounts.length > 1 && h('button', {
-                  type: 'button', className: 'dshUsageAccountAction', ref: cycleRef,
-                  onClick: cycleAccount, disabled: applying, title: t('cycleAccount'), 'aria-label': t('cycleAccount'),
-                }, h('svg', { viewBox: '0 0 20 20', width: 16, height: 16, fill: 'none', stroke: 'currentColor', strokeWidth: 1.5, strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': true },
-                  h('path', { d: 'M3 6h13m-3-3 3 3-3 3M17 14H4m3-3-3 3 3 3' }))),
-                kind === 'codex' && preview.isPreview && h('button', {
-                  type: 'button', className: 'dshUsageAccountAction', onClick: applyAccount, disabled: applying,
-                  title: t(applying ? 'applying' : 'applyAccount'), 'aria-label': t(applying ? 'applying' : 'applyAccount'),
-                }, h('svg', { viewBox: '0 0 20 20', width: 16, height: 16, fill: 'none', stroke: 'currentColor', strokeWidth: 1.7, strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': true }, h('path', { d: 'm4 10 4 4 8-8' }))),
-                h('span', { className: 'dshUsageSummary' }, kind === 'deepseek' && snapshot.status === 'ready' && !snapshot.value.signedOut ? snapshot.value.totals.map(formatWalletAmount).join(' · ') : t('details')),
+                h('button', {
+                   type: 'button', className: 'dshUsageAccountAction', onClick: refresh, disabled: refreshing,
+                   title: t(refreshing ? 'refreshing' : 'refresh'), 'aria-label': t(refreshing ? 'refreshing' : 'refresh'),
+                 }, '↻'),
+                 h('span', { className: 'dshUsageSummary' }, t('details')),
                 h('button', { type: 'button', className: 'dshUsageClose', onClick: () => close(true), 'aria-label': t('close') }, '×')),
-              actionError && h('div', { className: 'dshUsageActionError', role: 'alert' }, actionError),
-              h(UsageDetails, { snapshot: kind === 'codex' ? preview.detailSnapshot : snapshot, kind, model, modelName, now, isPreview: preview.isPreview, previewAccount: preview.accounts.find(account => account.id === preview.selectedId) })), document.body));
+              h(UsageDetails, { snapshot, kind, model, modelName, now })), document.body));
 
 
         }
@@ -555,11 +467,14 @@ function createUsageStore(request, { visible = () => true, schedule = setTimeout
             React.useCallback(fn => directory.subscribe(fn), [directory]),
             React.useCallback(() => directory.getSnapshot(), [directory]));
           React.useSyncExternalStore(fn => locale.subscribe(fn), () => locale.getSnapshot());
+          const [selectionRevision, setSelectionRevision] = React.useState(0);
+          React.useEffect(() => observeModelSelection(directory,
+            () => setSelectionRevision(value => value + 1)), [directory]);
           const current = state.current;
           const kind = usageKind(current?.provider);
           const group = state.groups?.find(group => group.id === current?.provider);
           const modelName = group?.models?.find(model => model.id === current?.model)?.name;
-          return kind ? h(UsageValue, { kind, model: current.model, modelName, providerName: group?.name, key: kind }) : null;
+          return kind ? h(UsageValue, { kind, provider: current.provider, model: current.model, modelName, providerName: group?.name, selectionRevision, key: JSON.stringify([kind, current.provider, current.model]) }) : null;
         }
         ctx.slots.inject('conversation.composer.dock', () => ctx.slots.register({
           name: 'conversation.composer.dock', id: 'dsh-usage', order: 20,
