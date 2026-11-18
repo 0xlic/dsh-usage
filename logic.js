@@ -4,8 +4,30 @@ export function usageKind(provider) {
   if (/^codex-sub-[a-f0-9]{32}$/.test(provider ?? '')) return 'codex';
   if (provider === 'deepseek-account') return 'deepseek';
   if (provider === 'capinfo') return 'capinfo';
-  // An API-key route is not billed to the signed-in DSH account.
+  if (provider === 'kimi-coding') return 'kimi-coding';
+  // API keys query their own billing account, not the signed-in DSH account.
+  if (provider === 'deepseek-official') return 'deepseek-api';
   return null;
+}
+
+// One choice per Codex account, not per model. Keep the session's model
+// wherever offered; only fall back when an account does not advertise it.
+export function codexModelChoices(groups, preferredModel) {
+  const accounts = (groups ?? []).filter(group => usageKind(group.id) === 'codex' && group.models?.length);
+  if (accounts.length < 2) return [];
+  return accounts.map(group => {
+    const model = group.models.find(model => model.id === preferredModel) || group.models[0];
+    return { provider: group.id, model: model.id, modelName: model.name, providerName: group.name };
+  });
+}
+
+export function sameUsageModel(a, b) {
+  return a?.provider === b?.provider && a?.model === b?.model;
+}
+
+export function nextUsageModel(choices, current) {
+  if (!choices.length) return null;
+  return choices[(choices.findIndex(choice => choice.provider === current?.provider) + 1) % choices.length];
 }
 
 export function quotaWindows(usage, model) {
@@ -27,7 +49,9 @@ export function quotaWindows(usage, model) {
 export function windowLabel(seconds) {
   if (Math.abs(seconds - 18000) < 60) return '5h';
   if (Math.abs(seconds - 604800) < 60) return '7day';
-  return seconds % 86400 === 0 ? `${seconds / 86400}day` : `${Math.round(seconds / 3600)}h`;
+  if (seconds % 86400 === 0) return `${seconds / 86400}day`;
+  if (seconds % 3600 === 0) return `${seconds / 3600}h`;
+  return seconds % 60 === 0 ? `${seconds / 60}m` : `${seconds}s`;
 }
 
 export function resetDuration(resetsAt, now = Date.now()) {
@@ -102,24 +126,36 @@ export function formatWalletAmount({ currency, amount }) {
   return `${symbol}${negative && cents !== 0n ? '-' : ''}${cents / 100n}.${String(cents % 100n).padStart(2, '0')}`;
 }
 
-// Never present retained historical data as current API-key quota.
-export function capinfoBalanceView(balance, now = Date.now()) {
-  const updatedAt = typeof balance?.updatedAt === 'string' ? Date.parse(balance.updatedAt) : NaN;
-  const base = { amount: '¥--', updatedAt: Number.isFinite(updatedAt) ? updatedAt : null };
-  const status = balance?.status;
-  if (status !== 'ready') return { ...base, reason: ({ pending: 'loading', unconfigured: 'keyRequired', unavailable: 'balanceUnavailable', error: 'failed', missing: 'capinfoMissing' })[status] || 'failed' };
-  if (!Number.isFinite(updatedAt) || now - updatedAt > 120000 || updatedAt > now + 60000) return { ...base, reason: 'balanceStale' };
-  const data = balance.data;
-  if (data?.isValid === false) return { ...base, reason: 'keyInvalid' };
-  if (data?.isValid !== true || data.unit !== 'CNY' || typeof data.unlimited !== 'boolean' || !Number.isFinite(data.used) ||
-      (data.unlimited ? data.remaining !== null || data.total !== null : !Number.isFinite(data.remaining) || !Number.isFinite(data.total))) return { ...base, reason: 'failed' };
-  const money = value => `¥${value.toFixed(2)}`;
-  return { ...base, reason: null, amount: data.unlimited ? '¥∞' : money(data.remaining),
-    total: data.unlimited ? '¥∞' : money(data.total), used: money(data.used) };
+// Capinfo uses only M / B, always with two decimal places (including zero).
+export function formatTokenCount(value) {
+  if (!Number.isSafeInteger(value) || value < 0) return '--';
+  const billions = value >= 1_000_000_000;
+  return `${(value / (billions ? 1_000_000_000 : 1_000_000)).toFixed(2)}${billions ? 'B' : 'M'}`;
+}
+
+export function formatCapinfoUnitCost({ amount, tokens }) {
+  if (!Number.isFinite(amount) || amount < 0 || !Number.isSafeInteger(tokens) || tokens <= 0) return '--';
+  const cost = amount * (1_000_000 / tokens);
+  return Number.isFinite(cost) ? `¥${cost.toFixed(2)} / 1M Token` : '--';
+}
+
+// The dock and details panel render the same raw dsh-capinfo snapshot.
+export function capinfoTodayView(snapshot) {
+  const value = snapshot?.status === 'ready' ? snapshot.value : null;
+  let reason = null;
+  if (!value || snapshot.status === 'failed') reason = snapshot?.status === 'failed' ? 'failed' : 'loading';
+  else if (value.status === 'missing') reason = 'capinfoMissing';
+  else if (value.status !== 'ready' || !value.data) reason = 'failed';
+  const data = reason ? null : value.data;
+  const amount = Number.isFinite(data?.amount) && data.amount >= 0 ? `¥${data.amount.toFixed(2)}` : '¥--';
+  const tokens = Number.isSafeInteger(data?.tokens) && data.tokens >= 0 ? formatTokenCount(data.tokens) : '--';
+  const refreshedAt = typeof data?.refreshedAt === 'string' && Number.isFinite(Date.parse(data.refreshedAt))
+    ? Date.parse(data.refreshedAt) : null;
+  return {amount, tokens, summary: `${amount} · ${tokens}`, refreshedAt, reason};
 }
 
 export function usageProviderTitle(kind, providerName) {
-  return kind === 'codex' ? 'Codex' : kind === 'deepseek' ? 'DeepSeek' : providerName || (kind === 'capinfo' ? 'Capinfo' : kind);
+  return kind === 'kimi-coding' ? 'Kimi Coding' : kind === 'codex' ? 'Codex' : kind === 'deepseek' ? 'DeepSeek' : kind === 'deepseek-api' ? 'DeepSeek API' : providerName || (kind === 'capinfo' ? 'Capinfo' : kind);
 }
 
 export function formatUsageDate(milliseconds, locale = 'zh-CN', timeZone) {
@@ -152,7 +188,7 @@ export function observeModelSelection(directory, onSelected) {
 
 // One shared read loop per provider/model, irrespective of mounted Session count.
 // Abort + generation checks prevent late account/session responses resurfacing.
-export function createUsageStore(request, { visible = () => true, schedule = setTimeout, cancel = clearTimeout, interval = 60000, onError = () => {} } = {}) {
+export function createUsageStore(request, { visible = () => true, schedule = setTimeout, cancel = clearTimeout, interval = 60000, onError = () => {}, cachedFirst = false } = {}) {
   let snapshot = { status: 'loading', value: null };
   let generation = 0, flight, timer, closed = false;
   const listeners = new Set();
@@ -183,10 +219,24 @@ export function createUsageStore(request, { visible = () => true, schedule = set
     getSnapshot: () => snapshot,
     subscribe(listener) {
       listeners.add(listener);
-      if (listeners.size === 1) refresh();
+      if (listeners.size === 1) {
+        if (!cachedFirst) refresh();
+        else {
+          // Show this exact route's retained snapshot immediately, ask the Host
+          // cache next, then revalidate without replacing content with loading.
+          const expected = generation;
+          Promise.resolve(refresh({ force: false, reason: 'cache' })).then(() => {
+            if (!closed && generation === expected && listeners.size && snapshot.status === 'ready')
+              refresh({ force: true, reason: 'revalidate' });
+          });
+        }
+      }
       return () => {
         listeners.delete(listener);
-        if (!listeners.size) { generation++; flight?.controller.abort(); flight = undefined; stop(); snapshot = { status: 'loading', value: null }; }
+        if (!listeners.size) {
+          generation++; flight?.controller.abort(); flight = undefined; stop();
+          if (!cachedFirst || snapshot.status !== 'ready') snapshot = { status: 'loading', value: null };
+        }
       };
     },
     refresh, invalidate,

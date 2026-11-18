@@ -2,45 +2,103 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import vm from 'node:vm';
-import { apply, inject } from '../index.js';
-import { usageKind, usageProviderTitle, capinfoBalanceView } from '../logic.js';
+import { apply } from '../index.js';
+import { usageKind, usageProviderTitle, capinfoTodayView, formatCapinfoUnitCost, formatTokenCount } from '../logic.js';
+import * as logic from '../logic.js';
 
-const now = Date.parse('2026-11-10T10:00:00Z');
-const ready = (data = {}) => ({ status: 'ready', updatedAt: new Date(now).toISOString(),
-  data: { isValid: true, remaining: 87.5, total: 100, used: 12.5, unit: 'CNY', unlimited: false, ...data } });
+const refreshedAt = '2026-11-13T09:39:58.747Z';
+const today = { amount: 0.8480409999999996, tokens: 5931951, refreshedAt };
+const ready = (data = {}) => ({ status: 'ready', value: { status: 'ready', data: { ...today, ...data } } });
 
-test('Capinfo routes by provider and displays finite, zero, negative and unlimited Key quota', () => {
+test('Capinfo routes by provider and formats tokens in M / B with two decimals', () => {
   assert.equal(usageKind('capinfo'), 'capinfo');
   assert.equal(usageKind('capinfo-other'), null);
   assert.equal(usageProviderTitle('capinfo'), 'Capinfo');
   assert.equal(usageProviderTitle('capinfo', 'capinfo'), 'capinfo');
-  assert.deepEqual(capinfoBalanceView(ready(), now), { amount: '¥87.50', total: '¥100.00', used: '¥12.50', updatedAt: now, reason: null });
-  assert.equal(capinfoBalanceView({ ...ready({ remaining: 299.8, total: 500, used: 200.2 }), demo: true }, now).amount, '¥299.80');
-  assert.equal(capinfoBalanceView(ready({ remaining: 0 }), now).amount, '¥0.00');
-  assert.equal(capinfoBalanceView(ready({ remaining: -2.5 }), now).amount, '¥-2.50');
-  const unlimited = capinfoBalanceView(ready({ unlimited: true, remaining: null, total: null }), now);
-  assert.equal(unlimited.amount, '¥∞');
-  assert.equal(unlimited.total, '¥∞');
-  assert.equal(unlimited.used, '¥12.50');
+  for (const [value, expected] of [
+    [0, '0.00M'], [999, '0.00M'], [1000, '0.00M'], [1200, '0.00M'],
+    [999999, '1.00M'], [1_000_000, '1.00M'], [5931951, '5.93M'],
+    [999_999_999, '1000.00M'], [1_000_000_000, '1.00B'],
+    [1_234_567_890, '1.23B'], [1_235_000_000, '1.24B'],
+    [1_000_000_000_000, '1000.00B'],
+  ]) assert.equal(formatTokenCount(value), expected);
+  for (const invalid of [-1, 1.5, NaN, Infinity, '12']) assert.equal(formatTokenCount(invalid), '--');
 });
 
-test('non-ready, invalid, malformed and stale snapshots never display retained money', () => {
-  for (const [status, reason] of Object.entries({ pending: 'loading', unconfigured: 'keyRequired', unavailable: 'balanceUnavailable', error: 'failed', missing: 'capinfoMissing' })) {
-    const value = capinfoBalanceView({ ...ready(), status }, now);
-    assert.equal(value.amount, '¥--');
-    assert.equal(value.reason, reason);
-    assert.equal(value.updatedAt, now);
-    assert.equal(value.total, undefined);
+test('Capinfo today view shows only the dsh-capinfo amount and token values', () => {
+  assert.deepEqual(capinfoTodayView(ready()), {
+    amount: '¥0.85', tokens: '5.93M', summary: '¥0.85 · 5.93M', refreshedAt: Date.parse(refreshedAt), reason: null,
+  });
+  assert.equal(capinfoTodayView(ready({ amount: 0 })).summary, '¥0.00 · 5.93M');
+  assert.equal(capinfoTodayView(ready({ amount: null })).summary, '¥-- · 5.93M');
+  assert.equal(capinfoTodayView(ready({ tokens: 0 })).summary, '¥0.85 · 0.00M');
+  assert.equal(capinfoTodayView(ready({ amount: null, tokens: 0 })).summary, '¥-- · 0.00M');
+  assert.equal(capinfoTodayView(ready({ amount: null, tokens: 0 })).reason, null);
+  assert.equal(capinfoTodayView(ready({ refreshedAt: null })).refreshedAt, null);
+  assert.equal(capinfoTodayView(ready({ refreshedAt: 'invalid' })).refreshedAt, null);
+  for (const amount of [NaN, -1, '1.2']) assert.equal(capinfoTodayView(ready({ amount })).summary, '¥-- · 5.93M');
+  for (const tokens of [-1, 1.5, '12']) assert.equal(capinfoTodayView(ready({ tokens })).summary, '¥0.85 · --');
+  assert.deepEqual(capinfoTodayView(null), { amount: '¥--', tokens: '--', summary: '¥-- · --', refreshedAt: null, reason: 'loading' });
+  assert.equal(capinfoTodayView({ status: 'failed', value: null }).reason, 'failed');
+  assert.equal(capinfoTodayView({ status: 'ready', value: { status: 'missing' } }).reason, 'capinfoMissing');
+  assert.equal(capinfoTodayView({ status: 'ready', value: { status: 'ready', data: null } }).reason, 'failed');
+});
+
+test('Capinfo unit cost uses raw daily totals and only rounds the result', () => {
+  assert.equal(formatCapinfoUnitCost({ amount: 0.00126, tokens: 2_000 }), '¥0.63 / 1M Token');
+  assert.equal(formatCapinfoUnitCost(today), '¥0.14 / 1M Token');
+  assert.equal(formatCapinfoUnitCost({ amount: 0, tokens: 1_000_000 }), '¥0.00 / 1M Token');
+  for (const amount of [null, undefined, -1, NaN, Infinity, '0.63']) {
+    assert.equal(formatCapinfoUnitCost({ amount, tokens: today.tokens }), '--');
   }
-  assert.equal(capinfoBalanceView(ready({ isValid: false }), now).reason, 'keyInvalid');
-  for (const data of [{ unit: 'USD' }, { unlimited: true }, { unlimited: 'true' }, { remaining: null }, { remaining: NaN }, { remaining: Infinity }, { used: '12.5' }, { total: null }, { isValid: null }]) {
-    assert.equal(capinfoBalanceView(ready(data), now).amount, '¥--');
+  for (const tokens of [0, undefined, -1, 1.5, Infinity, '1000']) {
+    assert.equal(formatCapinfoUnitCost({ amount: today.amount, tokens }), '--');
   }
-  for (const updatedAt of [null, 'invalid', new Date(now - 120001).toISOString(), new Date(now + 60001).toISOString()]) {
-    assert.equal(capinfoBalanceView({ ...ready(), updatedAt }, now).reason, 'balanceStale');
-  }
-  assert.equal(capinfoBalanceView(ready(), now + 120000).amount, '¥87.50');
-  assert.equal(capinfoBalanceView(null, now).amount, '¥--');
+});
+
+test('Capinfo client hides the entire entry until discovered and when the service is absent', async () => {
+  const source = await readFile(new URL('../client.source.js', import.meta.url), 'utf8');
+  let plugin, Usage, snapshot = {status: 'loading', value: null}, hookCount = 0;
+  const React = {
+    Fragment: 'fragment', createElement: (type, props, ...children) => ({type, props: {...props, children}}),
+    useSyncExternalStore: (_subscribe, get) => { hookCount++; return get(); },
+    // Simulate an already-open popover: a missing service must remove it too.
+    useState: initial => { hookCount++; return [initial === false ? true : typeof initial === 'function' ? initial() : initial, () => {}]; },
+    useRef: current => { hookCount++; return {current}; }, useId: () => { hookCount++; return 'capinfo-usage'; },
+    useEffect() { hookCount++; }, useLayoutEffect() { hookCount++; }, useCallback: fn => { hookCount++; return fn; },
+  };
+  const locale = {register() {}, bind: () => key => key, getSnapshot: () => ({active: 'en'}), subscribe() {}};
+  vm.runInNewContext(source, {...logic,
+    createUsageStore: () => ({subscribe() {}, getSnapshot: () => snapshot}),
+    window: {__ModuleLoader__: {load: value => { plugin = value; }}}, document: {}, console,
+  });
+  plugin.factory(name => name === 'react' ? React : {createPortal: node => node}).apply({
+    locale, get: name => ({locale, configForms: {get: () => ({subscribe() {}, getSnapshot: () => ({value: {performanceUsage: 'detailed'}})})}})[name],
+    effect() {}, on() {}, slots: {inject: (_name, fn) => fn(), register: (_options, Component) => { Usage = Component; }},
+  });
+  let provider = 'capinfo';
+  const directory = {getSnapshot: () => ({current: {provider, model: 'glm-5.3-flash'}})};
+  const render = () => {
+    hookCount = 0;
+    let node = Usage({controller: {store: directory}});
+    while (node && typeof node.type === 'function') node = node.type(node.props);
+    return node;
+  };
+  assert.equal(render(), null);
+  const expectedHooks = hookCount;
+  snapshot = {status: 'ready', value: {status: 'missing', data: null}};
+  assert.equal(render(), null);
+  assert.equal(hookCount, expectedHooks);
+  snapshot = ready();
+  assert.equal(render().props.children[1].type, 'button');
+  assert.equal(hookCount, expectedHooks);
+  // A later uninstall hides the open entry, and reinstall can reveal it again.
+  snapshot = {status: 'ready', value: {status: 'missing'}};
+  assert.equal(render(), null);
+  snapshot = ready({tokens: 0, amount: 0});
+  assert.equal(render().props.children[1].type, 'button');
+  provider = 'kimi-coding'; snapshot = {status: 'loading', value: null};
+  assert.equal(render().props.children[1].type, 'button');
 });
 
 test('Host registers independent authenticated exact route with lifecycle cleanup', () => {
@@ -53,43 +111,21 @@ test('Host registers independent authenticated exact route with lifecycle cleanu
   assert.equal(disposed, true);
 });
 
-test('Capinfo dock and details use quiet placeholders for every unavailable state', async () => {
+test('Capinfo host integration reads the dsh-capinfo service instead of the balance API', async () => {
   const source = await readFile(new URL('../client.source.js', import.meta.url), 'utf8');
-  const details = source.slice(source.indexOf('function UsageDetails('), source.indexOf('        function UsageValue('));
-  const compact = source.slice(source.indexOf('          let content;'), source.indexOf('          return h(React.Fragment, null,\n            h(\'style\''));
-  const h = (type, props, ...children) => ({ type: typeof type === 'function' ? type.name : type, props, children });
-  const snapshots = [
-    { status: 'loading', value: null },
-    { status: 'failed', value: null, error: 'verbose transport error' },
-    ...['pending', 'unconfigured', 'unavailable', 'error', 'missing'].map(status => ({ status: 'ready', value: { ...ready(), status, error: 'verbose Host error' } })),
-    { status: 'ready', value: ready({ isValid: false }) },
-    { status: 'ready', value: ready({ remaining: null }) },
-    { status: 'ready', value: { ...ready(), updatedAt: new Date(now - 120001).toISOString() } },
-  ];
-  const render = snapshot => {
-    const context = { snapshot, kind: 'capinfo', now, h, React: { Fragment: 'fragment' },
-      DetailRow: function DetailRow() {}, t: key => key, model: 'test-model',
-      capinfoBalanceView, locale: { getSnapshot: () => ({ active: 'zh-CN' }) },
-      formatUsageDate: () => 'formatted-date' };
-    return {
-      dock: vm.runInNewContext(`${compact}; content`, context),
-      details: vm.runInNewContext(`${details}; UsageDetails({ snapshot, kind, now, model })`, context),
-    };
-  };
-  for (const snapshot of snapshots) {
-    const tree = render(snapshot);
-    assert.equal(tree.dock.children.join(''), '¥--');
-    assert.equal(tree.dock.props.title, 'keyBalance');
-    const text = JSON.stringify(tree);
-    assert.equal((text.match(/¥--/g) || []).length, 4);
-    assert.match(text, /updatedAt.*--/);
-    assert.doesNotMatch(text, /verbose|failed|loading|keyInvalid|balanceStale|capinfoMissing|formatted-date|87\.50|dshUsageError|dshUsageReason/);
-  }
-  const success = JSON.stringify(render({ status: 'ready', value: ready() }));
-  assert.match(success, /¥87\.50/);
-  assert.match(success, /¥100\.00/);
-  assert.match(success, /¥12\.50/);
-  assert.match(success, /formatted-date/);
+  const host = await readFile(new URL('../host-capinfo.js', import.meta.url), 'utf8');
+  assert.match(source, /if \(kind === 'capinfo'\) content = h\('span', \{ title: t\('capinfoToday'\) \},/);
+  assert.match(source, /capinfoTodayView\(snapshot\)\.summary/);
+  assert.match(source, /h\(DetailRow, \{ label: t\('capinfoAmount'\) \}, today\.amount\)/);
+  assert.match(source, /h\(DetailRow, \{ label: t\('capinfoTokens'\) \}, today\.tokens\)/);
+  const panel = source.slice(source.indexOf('function UsageDetails('), source.indexOf("          if (snapshot.status !== 'ready') return h(React.Fragment"));
+  const unitCostRow = /h\(DetailRow, \{ label: t\('capinfoUnitCost'\) \}, formatCapinfoUnitCost\(snapshot\.value\.data\)\)/;
+  assert.match(panel, unitCostRow);
+  assert.doesNotMatch(source.replace(panel, ''), /formatCapinfoUnitCost\(/);
+  assert.match(source, /if \(next && kind === 'capinfo'\) void detailStore\.refresh\(\{ force: true, reason: 'open' \}\)/);
+  assert.doesNotMatch(source, /capinfoBalanceView|CAPINFO_API_KEY|user\/balance|capinfoBalance\.getSnapshot/);
+  assert.match(host, /capinfoUsage/);
+  assert.doesNotMatch(host, /\bfetch\b|Authorization|user\/balance|CAPINFO_API_KEY|DEFAULT_URL|credentials/);
 });
 
 test('all Client readers use the authenticated usage RPC with force and exact model identity', async () => {

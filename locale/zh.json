@@ -1,1 +1,1 @@
-{"meta":{"title":"账户用量","description":"独立查询所选 Codex 订阅限额、DeepSeek 账户余额和 Capinfo 额度；统一缓存、自动定时刷新、模型选择后刷新及手动刷新。"}}
+{"meta":{"title":"账户用量","description":"独立查询所选 Codex / Kimi Coding 订阅限额、DeepSeek 登录账户 / API Key 对应账户余额，并读取 Capinfo 今日费用与 Token；自动定时刷新、模型选择后刷新及手动刷新。"}}

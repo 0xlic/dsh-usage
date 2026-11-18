@@ -21,7 +21,7 @@ test('billing identity follows provider, not model name', () => {
   assert.equal(usageKind(`codex-sub-${'a'.repeat(32)}`), 'codex');
   assert.equal(usageKind('openai-codex'), null);
   assert.equal(usageKind('deepseek-account'), 'deepseek');
-  assert.equal(usageKind('deepseek-official'), null);
+  assert.equal(usageKind('deepseek-official'), 'deepseek-api');
   assert.equal(usageKind('custom'), null);
 });
 test('Codex standard, exact model and Spark pools stay separate', () => {
@@ -91,6 +91,45 @@ test('popover opens above trigger, clamps horizontal overflow, and fits short vi
   assert.deepEqual(usagePopoverPosition({ right: 400, top: 100, bottom: 120 }, { width: 300, height: 240 }, { width: 390, height: 300 }), { left: 78, top: 48 });
 });
 const tick = () => new Promise(resolve => setImmediate(resolve));
+test('Codex cached-first reads retain exact-route data across switches and revalidate in background', async () => {
+  const requests = [];
+  const store = createUsageStore((signal, options) => new Promise(resolve => requests.push({ signal, options, resolve })), {
+    cachedFirst: true, schedule: () => 1, cancel: () => {},
+  });
+  const off = store.subscribe(() => {});
+  await tick();
+  assert.equal(requests[0].options.force, false);
+  requests[0].resolve({ account: 'a', quota: 80 }); await tick();
+  assert.equal(requests[1].options.force, true);
+  assert.equal(store.getSnapshot().value.quota, 80);
+  requests[1].resolve({ account: 'a', quota: 75 }); await tick();
+  off();
+  assert.equal(store.getSnapshot().value.quota, 75);
+  const offAgain = store.subscribe(() => {});
+  assert.equal(store.getSnapshot().value.quota, 75); // no loading flash on switching back
+  await tick();
+  assert.equal(requests[2].options.force, false);
+  requests[2].resolve({ account: 'a', quota: 75 }); await tick();
+  assert.equal(requests[3].options.force, true);
+  assert.equal(store.getSnapshot().status, 'ready');
+  store.invalidate(); await tick(); // resets must still remove cached identity
+  assert.equal(store.getSnapshot().value, null);
+  assert.equal(requests[3].signal.aborted, true);
+  requests[3].resolve({ account: 'old', quota: 99 }); await tick();
+  assert.equal(store.getSnapshot().value, null);
+  offAgain(); store.dispose();
+});
+test('leaving during the cache read cancels the queued background refresh', async () => {
+  const requests = [];
+  const store = createUsageStore((_signal, options) => new Promise(resolve => requests.push({ options, resolve })), {
+    cachedFirst: true, schedule: () => 1, cancel: () => {},
+  });
+  const off = store.subscribe(() => {}); await tick();
+  off(); requests[0].resolve({ account: 'old' }); await tick();
+  assert.equal(requests.length, 1);
+  assert.equal(store.getSnapshot().value, null);
+  store.dispose();
+});
 test('shared store deduplicates reads and cancels its timer on final unmount', async () => {
   let calls = 0, cancels = 0;
   const store = createUsageStore(async () => ++calls, { schedule: () => 123, cancel: () => cancels++ });

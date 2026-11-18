@@ -1,7 +1,7 @@
 {
   "name": "dsh-usage",
-  "version": "0.4.0",
-  "description": "Model-aware Codex quotas, DeepSeek account balance and Capinfo API Key balance below the DSH composer",
+  "version": "0.5.0",
+  "description": "Model-aware Codex and Kimi Coding quotas, DeepSeek signed-in and API-key account balances and Capinfo daily spending and tokens below the DSH composer",
   "private": true,
   "type": "module",
   "license": "MIT",

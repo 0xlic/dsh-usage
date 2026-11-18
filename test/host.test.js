@@ -2,18 +2,16 @@ import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {HostUsageCache, UsageError} from '../host-cache.js';
 import {CodexUsageAdapter, parseCodexUsage, CODEX_USAGE_URL} from '../host-codex.js';
-import {CapinfoUsageAdapter, capinfoRoute, parseCapinfoBalance} from '../host-capinfo.js';
+import {CapinfoUsageAdapter} from '../host-capinfo.js';
 import {DeepSeekUsageAdapter} from '../host-deepseek.js';
 import {apply, inject, createUsageHost, validateUsageRequest} from '../index.js';
 const deferred = () => { let resolve, reject; const promise = new Promise((a,b) => { resolve=a; reject=b; }); return {promise,resolve,reject}; };
 const quota = {rate_limit: {primary_window: {used_percent: 12, limit_window_seconds: 18000, reset_after_seconds: 10}}};
-const balance = {success: true, source: 'api_key', currency: 'CNY', unit: 'CNY', is_active: true,
-  unlimited_quota: false, balance: 12.25, total: 100, used: 87.75};
 const id = `account-${'a'.repeat(32)}`, provider = `codex-sub-${'a'.repeat(32)}`, key = `codex-subscribe/${id}`;
 function credentials() {
   const records = new Map([[key, {kind:'grant', payload:{version:2,label:'first',email:'a@example.com',credential:{type:'oauth',access:'secret-access',refresh:'secret-refresh',expires:9999999999999,accountId:'account-id'}}}]]);
-  return {records, token:'capinfo-secret',
-    async resolve() { return this.token ? {value:this.token,source:'test'} : undefined; },
+  return {records,
+    async resolve() { return undefined; },
     async listRecords() { return [...records].map(([key,value]) => ({key,kind:value.kind})); },
     async readRecord(key) { return structuredClone(records.get(key)); },
     async modifyRecord(key, update) { const next = await update(structuredClone(records.get(key))); if(next) records.set(key,next); return structuredClone(records.get(key)); },
@@ -98,33 +96,25 @@ test('Codex HTTP and parsing errors are generic row failures and obey force cool
   await assert.rejects(adapter.read({provider,force:true}));assert.equal(calls,1);
   adapter.dispose();cache.dispose();
 });
-test('Capinfo exact source schema supports finite and unlimited quotas only', () => {
-  assert.equal(parseCapinfoBalance(balance).remaining,12.25);
-  assert.equal(parseCapinfoBalance({...balance,unlimited_quota:true,balance:null,total:null}).unlimited,true);
-  for(const changes of [{source:'account'},{unit:'USD'},{used:'87.75'},{used:Infinity},{is_active:'true'},{balance:null},{unlimited_quota:true}]) assert.throws(()=>parseCapinfoBalance({...balance,...changes}));
-});
-test('Capinfo config uses live owner profile and validates origin before credential lookup', () => {
-  const values={settings:{describe:()=>[{ns:'include:capinfo-models',value:{baseURL:'https://api.capinfo.com.cn/custom',balanceDemo:true}}]},
-    storageDomain:{get:()=>({global:{get:()=>({profile:{apiKeyEnv:'CUSTOM_KEY'}})}})}};
-  const ctx={get:key=>values[key]};assert.deepEqual(capinfoRoute(ctx),{url:'https://api.capinfo.com.cn/custom/user/balance',keyRef:'CUSTOM_KEY'});
-  for(const baseURL of ['http://api.capinfo.com.cn/v1','https://evil.test/v1','https://api.capinfo.com.cn:123/v1','https://user@api.capinfo.com.cn/v1','https://api.capinfo.com.cn/v1?x=1']){
-    values.settings.describe=()=>[{ns:'include:capinfo-models',value:{baseURL}}];assert.throws(()=>capinfoRoute(ctx));
+test('Capinfo reads the dsh-capinfo today snapshot directly, without HTTP or credentials', async () => {
+  const today={amount:0.8480409999999996,tokens:5931951,refreshedAt:'2026-11-13T09:39:58.747Z'};
+  let calls=0; const adapter=new CapinfoUsageAdapter({capinfoUsage:()=>({today(){calls++;return today;}}),now:()=>123});
+  assert.deepEqual(await adapter.read({}),{status:'ready',data:today,checkedAt:new Date(123).toISOString(),updatedAt:today.refreshedAt,error:null});
+  await adapter.read({force:true});assert.equal(calls,2);
+  assert.deepEqual(await new CapinfoUsageAdapter({capinfoUsage:()=>undefined}).read({}),{status:'missing',data:null,checkedAt:null,updatedAt:null,error:null});
+  for(const value of [null,{}, {amount:null,tokens:-1,refreshedAt:null},{amount:NaN,tokens:1,refreshedAt:null},{amount:0,tokens:1,refreshedAt:'bad'}]){
+    await assert.rejects(new CapinfoUsageAdapter({capinfoUsage:()=>({today:()=>value})}).read({}),error=>error.code==='usage/unavailable');
   }
+  await assert.rejects(new CapinfoUsageAdapter({capinfoUsage:()=>({today(){throw new Error('secret');}})}).read({}),
+    error=>error.code==='usage/unavailable'&&!error.message.includes('secret'));
 });
-test('Capinfo directly queries current key, shares cache, clears on removal and blocks late key responses', async () => {
-  const creds=credentials(),cache=new HostUsageCache();let calls=0;const route=()=>({url:'https://api.capinfo.com.cn/v1/user/balance',keyRef:'CAPINFO_API_KEY'});
-  const adapter=new CapinfoUsageAdapter({credentials:creds,cache,route,fetch:async(url,options)=>{calls++;assert.equal(url,route().url);assert.equal(options.headers.Authorization,`Bearer ${creds.token}`);assert.equal(options.headers['User-Agent'],'cc-switch/1.0');return Response.json(balance);}});
-  assert.equal((await adapter.read({})).data.remaining,12.25);await adapter.read({});assert.equal(calls,1);
-  creds.token='';assert.equal((await adapter.read({})).status,'unconfigured');creds.token='capinfo-secret';await adapter.read({});assert.equal(calls,2);
-  const gate=deferred(),started=deferred();adapter.fetch=async()=>{started.resolve();await gate.promise;return Response.json(balance);};
-  const late=adapter.read({force:true});await started.promise;creds.token='new-secret';gate.resolve();await assert.rejects(late,/changed/);
-  adapter.dispose();cache.dispose();
-});
-test('Capinfo 404 is not simulated and upstream arbitrary errors are not leaked', async () => {
-  const creds=credentials(),cache=new HostUsageCache();const adapter=new CapinfoUsageAdapter({credentials:creds,cache,
-    route:()=>({url:'https://api.capinfo.com.cn/v1/user/balance',keyRef:'CAPINFO_API_KEY'}),fetch:async()=>new Response('capinfo-secret',{status:404})});
-  await assert.rejects(adapter.read({}),error=>error.code==='usage/not-available'&&!error.message.includes('secret'));
-  adapter.dispose();cache.dispose();
+test('Capinfo RPC forwards the service snapshot and never leaks connection configuration', async () => {
+  const today={amount:0.12,tokens:1200,refreshedAt:'2026-11-13T09:39:58.747Z'};
+  const host=createUsageHost({credentials:{},get:key=>key==='capinfoUsage'?{today:()=>today}:undefined});
+  const result=await host.dispatch('usage/read',{kind:'capinfo',provider:'capinfo'});
+  assert.equal(result.ok,true);assert.deepEqual(result.value.data,today);
+  assert.doesNotMatch(JSON.stringify(result),/credential|authorization|user\/balance|api\.capinfo/i);
+  host.dispose();
 });
 test('DeepSeek uses owner lifecycle, exact wallet arithmetic and identity-aware shared cache', async () => {
   const cache=new HostUsageCache();let token='first',calls=0;const client={version:'0.2.2-rc.1',locale:'zh-CN',timezoneOffsetSeconds:28800};
@@ -143,7 +133,7 @@ test('RPC validates provider/kind/payload, sanitizes unknown failures and regist
     assert.equal((await (await route.fetch(new Request('http://localhost/api/plugins/usage/read',{method:'POST',body:JSON.stringify(payload)}))).json()).error.code,'usage/invalid-request');
   }
   assert.throws(()=>validateUsageRequest({kind:'deepseek',provider:'deepseek-account',client:{version:'bad\n',locale:'en',timezoneOffsetSeconds:0}}));
-  const host=createUsageHost(ctx,{route:()=>{throw new Error('credential-secret');}});
-  const failure=await host.dispatch('usage/read',{kind:'capinfo',provider:'capinfo'});assert.equal(failure.ok,false);assert.doesNotMatch(JSON.stringify(failure),/credential-secret/);host.dispose();
+  const host=createUsageHost({credentials:{},get:key=>{if(key==='capinfoUsage')throw new Error('credential-secret');}});
+  const failure=await host.dispatch('usage/read',{kind:'capinfo',provider:'capinfo'});assert.equal(failure.ok,false);assert.equal(failure.error.code,'usage/unavailable');assert.doesNotMatch(JSON.stringify(failure),/credential-secret/);host.dispose();
   for(const dispose of cleanups)dispose();assert.equal(disposed,true);
 });

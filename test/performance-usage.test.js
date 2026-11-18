@@ -40,12 +40,12 @@ test('live performance preference hides only weekly dock quotas, never popover d
   });
   const text = node => node == null || node === false ? '' : Array.isArray(node) ? node.map(text).join(' ') : typeof node === 'object' ? text(node.props.children) : String(node);
   const render = () => {
-    const value = Usage({ directory });
+    const value = Usage({ controller: { store: directory } });
     return value.type(value.props);
   };
   const summary = () => text(render().props.children[1]);
   assert.match(summary(), /5h 80%.*7day 80%/); // unset retains the detailed default
-  const unsubscribe = subscriptions.at(-2)(() => {}); // preference source, before the usage source
+  const unsubscribe = subscriptions.at(-3)(() => {}); // preference source, before dock and detail usage sources
   assert.equal(typeof settingsListener, 'function');
   mode = 'compact';
   settingsListener();
@@ -57,7 +57,7 @@ test('live performance preference hides only weekly dock quotas, never popover d
   let call = 0;
   React.useState = initial => ++call === 3 ? [true, () => {}] : originalState(initial);
   const opened = render();
-  const detailsElement = opened.props.children[2].props.children[1];
+  const detailsElement = opened.props.children[2].props.children.find(node => node?.type?.name === 'UsageDetails');
   const details = text(detailsElement.type(detailsElement.props));
   assert.match(details, /fiveHour/);
   assert.match(details, /sevenDay/);
