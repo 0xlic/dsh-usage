@@ -88,7 +88,7 @@ window.__ModuleLoader__.load({
 .dshUsageReason{color:var(--dsw-alias-label-secondary);opacity:.85;max-width:min(420px,60vw);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 `;
     const unwrap = result => {
-      if (result?.ok !== true) throw new Error(result?.error?.message || 'Usage read failed');
+      if (result?.ok !== true) throw Object.assign(new Error(result?.error?.message || 'Usage read failed'), { code: result?.error?.code });
       return result.value;
     };
     return {
@@ -115,9 +115,12 @@ window.__ModuleLoader__.load({
           const queryFailed = kind === 'kimi-coding' ? 'kimiQueryFailed' : 'apiQueryFailed';
           if (!response.ok) throw new Error(['deepseek-api', 'kimi-coding'].includes(kind) ? t(queryFailed) : 'Usage query failed');
           const result = await response.json();
-          if (['deepseek-api', 'kimi-coding'].includes(kind) && result?.ok !== true) throw new Error(t({
-            'usage/auth-required': 'apiKeyRejected', 'usage/configuration': kind === 'kimi-coding' ? 'kimiConfiguration' : 'apiConfiguration',
-          }[result?.error?.code] || queryFailed));
+          if (['deepseek-api', 'kimi-coding'].includes(kind) && result?.ok !== true) {
+            const code = result?.error?.code;
+            throw Object.assign(new Error(t({
+              'usage/auth-required': 'apiKeyRejected', 'usage/configuration': kind === 'kimi-coding' ? 'kimiConfiguration' : 'apiConfiguration',
+            }[code] || queryFailed)), { code });
+          }
           return unwrap(result);
         }
         const stores = new Map();

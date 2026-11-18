@@ -204,6 +204,9 @@ export function createUsageStore(request, { visible = () => true, schedule = set
       if (!closed && own.generation === generation) publish({ status: 'ready', value });
     }).catch(error => {
       if (!closed && own.generation === generation) {
+        // A background read should not replace this route's last good snapshot.
+        const background = ['timer', 'cache', 'revalidate'].includes(options.reason);
+        if (background && snapshot.status === 'ready' && error?.code !== 'usage/identity-changed') return;
         try { onError(error); } catch {}
         publish({ status: 'failed', value: null, error: String(error?.message ?? error).replace(/[\u0000-\u001f\u007f]/g, ' ').slice(0, 300) });
       }

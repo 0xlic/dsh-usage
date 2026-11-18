@@ -157,7 +157,63 @@ test('account invalidation discards late in-flight account data', async () => {
   assert.deepEqual(store.getSnapshot().value, { account: 'new' });
   off(); store.dispose();
 });
-test('failed reads drop old values rather than silently presenting stale quota', async () => {
+for (const cachedFirst of [false, true]) {
+  test(`automatic refresh retains the last snapshot and retries (cachedFirst: ${cachedFirst})`, async () => {
+    let timer, fail = false, amount = 42, publications = 0;
+    const reported = [];
+    const store = createUsageStore(async () => {
+      if (fail) throw new Error('temporarily unavailable');
+      return { amount, updatedAt: amount };
+    }, {
+      cachedFirst, schedule: fn => { timer = fn; return 1; }, cancel: () => { timer = undefined; },
+      onError: error => reported.push(error.message),
+    });
+    const off = store.subscribe(() => publications++);
+    try {
+      await tick();
+      const previous = store.getSnapshot(), count = publications;
+      assert.deepEqual(previous, { status: 'ready', value: { amount: 42, updatedAt: 42 } });
+      fail = true;
+      for (let attempt = 0; attempt < 2; attempt++) { timer(); await tick(); }
+      assert.equal(store.getSnapshot(), previous);
+      assert.equal(publications, count);
+      assert.deepEqual(reported, []);
+      fail = false;
+      amount = 24;
+      timer(); await tick();
+      assert.deepEqual(store.getSnapshot(), { status: 'ready', value: { amount: 24, updatedAt: 24 } });
+    } finally { off(); store.dispose(); }
+  });
+}
+
+test('failed Codex background revalidation keeps the cached-first result', async () => {
+  const requests = [];
+  const store = createUsageStore(async (_signal, { reason }) => {
+    requests.push(reason);
+    if (reason !== 'cache') throw new Error('temporarily unavailable');
+    return 42;
+  }, { cachedFirst: true, schedule: () => 1, cancel: () => {} });
+  const off = store.subscribe(() => {});
+  await tick();
+  assert.deepEqual(requests, ['cache', 'revalidate']);
+  assert.deepEqual(store.getSnapshot(), { status: 'ready', value: 42 });
+  off(); store.dispose();
+});
+
+test('an explicit identity change clears cached data even on the timer', async () => {
+  let changed = false;
+  const store = createUsageStore(async () => {
+    if (changed) throw Object.assign(new Error('Account credentials changed'), { code: 'usage/identity-changed' });
+    return 42;
+  }, { schedule: () => 1, cancel: () => {} });
+  const off = store.subscribe(() => {});
+  await tick(); changed = true;
+  await store.refresh();
+  assert.deepEqual(store.getSnapshot(), { status: 'failed', value: null, error: 'Account credentials changed' });
+  off(); store.dispose();
+});
+
+test('manual refresh still reports failure', async () => {
   let fail = false;
   const reported = [];
   const store = createUsageStore(async () => { if (fail) throw new Error('expired'); return 42; }, {
@@ -165,7 +221,7 @@ test('failed reads drop old values rather than silently presenting stale quota',
   });
   const off = store.subscribe(() => {});
   await tick(); fail = true;
-  await store.refresh();
+  await store.refresh({ force: true, reason: 'manual' });
   assert.deepEqual(store.getSnapshot(), { status: 'failed', value: null, error: 'expired' });
   assert.deepEqual(reported, ['expired']);
   off(); store.dispose();

@@ -8,7 +8,7 @@
 - **DeepSeek 账户**：Host 调用 DSH 内置 `deepseekAccount.getBalance()`，按币种精确合计充值与赠金；详情分列两种钱包和合计。
 - **DeepSeek API**：`deepseek-official` 使用当前路由的 API Key，由 Host 请求[官方余额接口](https://api-docs.deepseek.com/zh-cn/api/get-user-balance.md) `GET https://api.deepseek.com/user/balance`。复用账户余额的底栏和详情样式，显示总余额、充值余额、未过期赠金和查询时间；支持 CNY / USD，缺失或无效金额字段不展示，真实的零余额正常显示。余额属于该 Key 对应的账户，不是 Key 独立额度，也不借用 DSH 登录账号的钱包。跟随提供商设置目录中的 `apiKeyEnv`（默认 `DEEPSEEK_API_KEY`）及 `baseURL` / 启动环境 `DEEPSEEK_BASE_URL`；自定义非官方地址不查询官方余额，密钥只由 Host 解析且禁止跟随重定向。公开 API 未提供历史消费、累计 Token、限额或重置时间查询，因此不展示这些指标，不用余额差值推算消费。
 - **Kimi Coding**：选择 `kimi-coding` 提供商时，Host 使用该路由的 `apiKeyEnv`（默认 `KIMI_API_KEY`）请求 `GET https://api.kimi.com/coding/v1/usages`，支持官方 `api.kimi.ai` 国际端点。沿 DSH 提供商目录读取嵌套配置，复用已有密钥，无需额外输入。底栏显示服务端返回的窗口剩余百分比和重置倒计时，详情显示完整窗口、重置时间和查询时间；紧凑模式隐藏底栏的 7 天窗口，但保留详情。`usage` 按 7 天限额展示，不称为月度/总额度；暂不展示加油包、月度消费或 Token 统计。仅查询官方 `/coding`、`/coding/v1` 路由，代理/自定义地址不发送密钥、不查询官方用量；密钥不传到浏览器，禁止重定向。该接口未有稳定公开协议保证，字段依据 [Kimi 用量响应资料](https://github.com/PowerUserZ/OpenTokenUsage/blob/main/docs/providers/kimi.md) 实现，需使用真实 API Key 验证。
-- **Capinfo**：不请求 Capinfo 余额接口，直接读取 `@local/dsh-capinfo` 通过 Cordis 暴露的只读 `capinfoUsage` 服务（`today()`），展示该插件统计的今日费用和今日 Token。底栏只显示金额与 Token，以 `·` 分隔，Token 使用 `K` / `M` / `B` 英文简写（如 `¥0.12 · 5.9M`）；详情面板使用同一快照，以原始今日费用 ÷ 今日 Token × 1,000,000 计算每百万 Token 的平均单位成本，不为此新增请求；Token 为零或费用缺失时显示 `--`。打开面板时仍会再读取一次快照。服务未启用、读取失败或尚未采样时显示占位符，不展示旧金额或错误原文。
+- **Capinfo**：不请求 Capinfo 余额接口，直接读取 `@local/dsh-capinfo` 通过 Cordis 暴露的只读 `capinfoUsage` 服务（`today()`），展示该插件统计的今日费用和今日 Token。底栏只显示金额与 Token，以 `·` 分隔，Token 使用 `K` / `M` / `B` 英文简写（如 `¥0.12 · 5.9M`）；详情面板使用同一快照，以原始今日费用 ÷ 今日 Token × 1,000,000 计算每百万 Token 的平均单位成本，不为此新增请求；Token 为零或费用缺失时显示 `--`。打开面板时仍会再读取一次快照。服务未启用、尚未采样或首次读取失败时显示占位符，不展示错误原文。
 
 Codex 账号随当前模型提供商选择。详情里预览其他 Codex 账号不会改变当前账号，只有确认切换才会更新模型提供商。
 
@@ -32,7 +32,7 @@ Host 复用 Codex OAuth，调用 [Codex 客户端使用的重置卡接口](https
 
 1. 初次显示或切换提供商/模型后立即刷新。
 2. 成功选定模型后刷新，**再次选中同一个模型**或改变推理档位也刷新；选择失败不触发。
-3. 显示期间每 60 秒刷新，页面隐藏时停止计时，回到前台或窗口重新获得焦点时刷新。
+3. 显示期间每 60 秒刷新，页面隐藏时停止计时，回到前台或窗口重新获得焦点时刷新。所有提供商的后台刷新失败时，继续显示同一路由上次成功取得的数据和原更新时间，不显示刷新错误，下次照常重试。已确认的凭据身份变化不会沿用旧数据。
 4. 点击用量打开详情后，标题旁的 **↻** 可手动刷新，刷新中按钮禁用。
 5. 最后一个订阅卸载后停止客户端轮询，晚到响应不能恢复已失效的显示。
 
